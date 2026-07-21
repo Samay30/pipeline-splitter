@@ -13,7 +13,7 @@
 
 import ExcelJS from "exceljs";
 import { graphFetch, graphJson, uploadFile } from "./graph";
-import { planKeep } from "./tabs";
+import { inferYear, planKeep } from "./tabs";
 
 const CHUNK_ROWS = 500;
 
@@ -98,7 +98,7 @@ export async function splitWorkbook(opts: {
       sh
     );
     const ordered = sheets.value.sort((a, b) => a.position - b.position).map((s) => s.name);
-    const plan = planKeep(ordered, weeksToKeep);
+    const plan = planKeep(ordered, weeksToKeep, inferYear(masterName, ordered));
 
     const out = new ExcelJS.Workbook();
     out.creator = "eggers-internal pipeline-sync";
