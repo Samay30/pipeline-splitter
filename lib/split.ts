@@ -17,6 +17,14 @@ import { inferYear, planKeep } from "./tabs";
 
 const CHUNK_ROWS = 500;
 
+/**
+ * Every sheet in the recap gets this marker injected as its first row.
+ * The M365 connector's text extraction flattens all sheets into one blob
+ * and strips sheet names; this banner puts the tab's identity into the
+ * cell data itself, where flattening can't lose it.
+ */
+const SHEET_BANNER = (name: string) => `=== SHEET: ${name} ===`;
+
 interface RangeMeta {
   address: string;
   rowCount: number;
@@ -121,6 +129,7 @@ export async function splitWorkbook(opts: {
       const a1 = meta.address.includes("!") ? meta.address.slice(meta.address.lastIndexOf("!") + 1) : meta.address;
       const { r1, c1, r2, c2 } = parseA1Range(a1);
       const endCol = colLetter(c2);
+      const colWidths = new Map<number, number>();
 
       for (let rowStart = r1; rowStart <= r2; rowStart += CHUNK_ROWS) {
         const rowEnd = Math.min(rowStart + CHUNK_ROWS - 1, r2);
@@ -144,9 +153,18 @@ export async function splitWorkbook(opts: {
             cell.value = v as ExcelJS.CellValue;
             const fmt = data.numberFormat?.[i]?.[j];
             if (fmt && fmt !== "General") cell.numFmt = fmt;
+            const isDateFmt = !!fmt && /[dmy]/i.test(fmt) && fmt !== "General";
+            const rendered = typeof v === "number" && isDateFmt ? 12 : String(v).length;
+            const col = c1 + j;
+            if ((colWidths.get(col) ?? 0) < rendered) colWidths.set(col, rendered);
           }
         }
       }
+
+      for (const [col, w] of colWidths) {
+        ws.getColumn(col).width = Math.min(Math.max(w + 2, 10), 45);
+      }
+      ws.spliceRows(1, 0, [SHEET_BANNER(sheetName)]);
     }
 
     const buffer = new Uint8Array(await out.xlsx.writeBuffer());
