@@ -3,6 +3,11 @@
  * master pipeline workbook so the Claude M365 connector (whose renderer
  * caps how much of a workbook it will extract) can always read them.
  *
+ * Each recap now also carries a derived KPI_TABLE sheet: one row per week
+ * with all 8 metrics denormalized onto that row, so every metric — not
+ * just First/Second Interviews — is unambiguous after the connector
+ * flattens the file to text.
+ *
  * Invocation:
  *   - Vercel Cron (schedule in vercel.json). Vercel automatically sends
  *     "Authorization: Bearer <CRON_SECRET>" when CRON_SECRET is set.
@@ -10,6 +15,12 @@
  *                https://<deployment>/api/cron
  *   - Options: ?dryRun=1        build but don't upload (test mode)
  *              ?file=<name>     sync only one master workbook
+ *              ?verbose=1       include full KPI extraction diagnostics
+ *                               (which metric columns were located, etc.)
+ *
+ * First-run tip: run once with ?dryRun=1&verbose=1 and read each report's
+ * kpiDiagnostics before trusting the schedule — it shows exactly which
+ * metric headers the KPI parser found and how many week rows it produced.
  */
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
@@ -26,6 +37,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   const dryRun = req.query.dryRun === "1" || req.query.dryRun === "true";
+  const verbose = req.query.verbose === "1" || req.query.verbose === "true";
   const onlyFile = typeof req.query.file === "string" ? req.query.file : null;
 
   const folderPath = optionalEnv("PIPELINE_FOLDER_PATH", "eggers-pipeline");
@@ -60,8 +72,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    // Sequential on purpose: parallel workbook sessions on one drive
-    // invite Graph throttling, and the cron has a generous time budget.
     for (const master of masters) {
       try {
         reports.push(
@@ -88,15 +98,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
+    // Unless ?verbose=1, keep the response light: drop the (large) per-file
+    // KPI diagnostics but always keep the row count + source tab so the
+    // schedule's health is visible at a glance.
+    const shaped = reports.map((r) => {
+      if (verbose) return r;
+      const { kpiDiagnostics, ...rest } = r;
+      return rest;
+    });
+
     const failed = reports.filter((r) => r.error);
+    const kpiEmpty = reports.filter((r) => !r.error && !r.kpiRowCount).map((r) => r.master);
+
     return res.status(failed.length === reports.length && reports.length > 0 ? 500 : 200).json({
       started,
       finished: new Date().toISOString(),
       dryRun,
+      verbose,
       folderPath,
       synced: reports.length - failed.length,
       failed: failed.length,
-      reports,
+      /** Masters whose KPI_TABLE came back empty — worth a look with ?verbose=1. */
+      kpiEmpty,
+      reports: shaped,
     });
   } catch (err) {
     return res.status(500).json({

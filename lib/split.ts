@@ -6,24 +6,38 @@
  *
  * The recap file mirrors the master's most recent weekly tabs plus all
  * non-date tabs, preserving cell values and number formats (so dates
- * stay real dates). Formulas are flattened to their computed values —
- * intentional: omitted sheets would otherwise leave broken references,
- * and the recap is a read-only derived artifact anyway.
+ * stay real dates). Formulas are flattened to their computed values.
+ *
+ * NEW: the recap also gets a derived KPI_TABLE sheet — one row per week
+ * with all 8 metrics denormalized onto that single row. The embedded KPI
+ * grid inside a weekly tab is several side-by-side / stacked mini-tables;
+ * when the connector flattens the file to text, which number belongs to
+ * which week/metric becomes ambiguous for everything except First/Second
+ * Interviews. KPI_TABLE removes that ambiguity: because every metric for a
+ * week sits on ONE spreadsheet row, flattening keeps them together. Built
+ * from the newest kept weekly tab, whose running grid already spans the
+ * whole year, so we parse only one tab.
  */
 
 import ExcelJS from "exceljs";
 import { graphFetch, graphJson, uploadFile } from "./graph";
-import { inferYear, planKeep } from "./tabs";
+import {
+  inferYear,
+  planKeep,
+  newestWeeklyTab,
+  buildKpiTable,
+  kpiRowToArray,
+  KPI_TABLE_HEADERS,
+  type KpiDiagnostics,
+} from "./tabs";
 
 const CHUNK_ROWS = 500;
 
-/**
- * Every sheet in the recap gets this marker injected as its first row.
- * The M365 connector's text extraction flattens all sheets into one blob
- * and strips sheet names; this banner puts the tab's identity into the
- * cell data itself, where flattening can't lose it.
- */
+/** Injected as each sheet's first row so flattening can't lose tab identity. */
 const SHEET_BANNER = (name: string) => `=== SHEET: ${name} ===`;
+
+/** Name of the derived KPI sheet. */
+const KPI_SHEET_NAME = "KPI_TABLE";
 
 interface RangeMeta {
   address: string;
@@ -43,11 +57,16 @@ export interface FileReport {
   droppedWeeklyTabs: string[];
   recapBytes: number;
   ms: number;
+  /** NEW: how many week rows the KPI_TABLE sheet ended up with (0 = not built). */
+  kpiRowCount?: number;
+  /** NEW: which weekly tab the KPI grid was parsed from. */
+  kpiSourceTab?: string;
+  /** NEW: full extraction diagnostics — read this on the first dry run. */
+  kpiDiagnostics?: KpiDiagnostics;
   error?: string;
 }
 
 function wsUrl(driveId: string, itemId: string, sheetName: string, tail: string): string {
-  // Single quotes inside sheet names must be doubled per OData rules.
   const escaped = sheetName.replace(/'/g, "''");
   return `/drives/${driveId}/items/${itemId}/workbook/worksheets('${encodeURIComponent(escaped)}')${tail}`;
 }
@@ -78,6 +97,58 @@ function parseA1Range(a1: string): { r1: number; c1: number; r2: number; c2: num
   return { r1: first.row, c1: first.col, r2: last.row, c2: last.col };
 }
 
+/**
+ * Fetch a sheet's entire used range as dense grid-local 2D arrays
+ * (values + numberFormat), indices starting at [0][0] = used-range
+ * top-left. Used to feed buildKpiTable. Returns null for an empty sheet.
+ */
+async function fetchSheetGrid(
+  driveId: string,
+  itemId: string,
+  sheetName: string,
+  sh: Record<string, string>
+): Promise<{ values: unknown[][]; numberFormat: string[][] } | null> {
+  let meta: RangeMeta;
+  try {
+    meta = await graphJson<RangeMeta>(
+      wsUrl(driveId, itemId, sheetName, `/usedRange?$select=address,rowCount,columnCount`),
+      {},
+      sh
+    );
+  } catch {
+    return null;
+  }
+  const a1 = meta.address.includes("!") ? meta.address.slice(meta.address.lastIndexOf("!") + 1) : meta.address;
+  const { r1, c1, r2, c2 } = parseA1Range(a1);
+  const endCol = colLetter(c2);
+  const width = c2 - c1 + 1;
+
+  const values: unknown[][] = [];
+  const numberFormat: string[][] = [];
+  for (let rowStart = r1; rowStart <= r2; rowStart += CHUNK_ROWS) {
+    const rowEnd = Math.min(rowStart + CHUNK_ROWS - 1, r2);
+    const addr = `${colLetter(c1)}${rowStart}:${endCol}${rowEnd}`;
+    const data = await graphJson<RangeData>(
+      wsUrl(driveId, itemId, sheetName, `/range(address='${addr}')?$select=values,numberFormat`),
+      {},
+      sh
+    );
+    for (let i = 0; i < data.values.length; i++) {
+      const vRow = data.values[i] ?? [];
+      const fRow = data.numberFormat?.[i] ?? [];
+      const outV: unknown[] = new Array(width).fill("");
+      const outF: string[] = new Array(width).fill("General");
+      for (let j = 0; j < width; j++) {
+        outV[j] = vRow[j] ?? "";
+        outF[j] = fRow[j] ?? "General";
+      }
+      values.push(outV);
+      numberFormat.push(outF);
+    }
+  }
+  return { values, numberFormat };
+}
+
 export async function splitWorkbook(opts: {
   driveId: string;
   folderPath: string;
@@ -92,7 +163,6 @@ export async function splitWorkbook(opts: {
   const recapName = masterName.replace(/\.xlsx$/i, "") + recapSuffix + ".xlsx";
   const base = `/drives/${driveId}/items/${itemId}/workbook`;
 
-  // Read-only workbook session: better perf + consistent snapshot across calls.
   const session = await graphJson<{ id: string }>(`${base}/createSession`, {
     method: "POST",
     body: JSON.stringify({ persistChanges: false }),
@@ -106,7 +176,8 @@ export async function splitWorkbook(opts: {
       sh
     );
     const ordered = sheets.value.sort((a, b) => a.position - b.position).map((s) => s.name);
-    const plan = planKeep(ordered, weeksToKeep, inferYear(masterName, ordered));
+    const defaultYear = inferYear(masterName, ordered);
+    const plan = planKeep(ordered, weeksToKeep, defaultYear);
 
     const out = new ExcelJS.Workbook();
     out.creator = "eggers-internal pipeline-sync";
@@ -115,7 +186,6 @@ export async function splitWorkbook(opts: {
     for (const sheetName of plan.keep) {
       const ws = out.addWorksheet(sheetName);
 
-      // Discover used range; a truly empty sheet 404s or returns A1 only.
       let meta: RangeMeta;
       try {
         meta = await graphJson<RangeMeta>(
@@ -124,7 +194,7 @@ export async function splitWorkbook(opts: {
           sh
         );
       } catch {
-        continue; // empty sheet — keep it as a blank tab
+        continue;
       }
       const a1 = meta.address.includes("!") ? meta.address.slice(meta.address.lastIndexOf("!") + 1) : meta.address;
       const { r1, c1, r2, c2 } = parseA1Range(a1);
@@ -135,12 +205,7 @@ export async function splitWorkbook(opts: {
         const rowEnd = Math.min(rowStart + CHUNK_ROWS - 1, r2);
         const addr = `${colLetter(c1)}${rowStart}:${endCol}${rowEnd}`;
         const data = await graphJson<RangeData>(
-          wsUrl(
-            driveId,
-            itemId,
-            sheetName,
-            `/range(address='${addr}')?$select=values,numberFormat`
-          ),
+          wsUrl(driveId, itemId, sheetName, `/range(address='${addr}')?$select=values,numberFormat`),
           {},
           sh
         );
@@ -167,6 +232,49 @@ export async function splitWorkbook(opts: {
       ws.spliceRows(1, 0, [SHEET_BANNER(sheetName)]);
     }
 
+    // ---- Derived KPI_TABLE sheet ---------------------------------------
+    let kpiRowCount = 0;
+    let kpiSourceTab: string | undefined;
+    let kpiDiagnostics: KpiDiagnostics | undefined;
+    try {
+      const source = newestWeeklyTab(plan.keep, defaultYear);
+      if (source) {
+        kpiSourceTab = source;
+        const grid = await fetchSheetGrid(driveId, itemId, source, sh);
+        if (grid) {
+          const { rows, diagnostics } = buildKpiTable(grid.values, grid.numberFormat);
+          kpiDiagnostics = diagnostics;
+          kpiRowCount = rows.length;
+
+          const ws = out.addWorksheet(KPI_SHEET_NAME);
+          ws.addRow([SHEET_BANNER(KPI_SHEET_NAME)]);
+          ws.addRow(KPI_TABLE_HEADERS);
+          for (const r of rows) {
+            const arr = kpiRowToArray(r);
+            const row = ws.addRow(arr);
+            // Render the Week cell as a real date.
+            const wk = row.getCell(1);
+            if (typeof arr[0] === "string" && /^\d{4}-\d{2}-\d{2}$/.test(arr[0])) {
+              wk.value = new Date(arr[0] + "T00:00:00Z");
+              wk.numFmt = "yyyy-mm-dd";
+            }
+          }
+          ws.getColumn(1).width = 12;
+          for (let c = 2; c <= KPI_TABLE_HEADERS.length; c++) ws.getColumn(c).width = 20;
+        }
+      }
+    } catch (kpiErr) {
+      // KPI sheet is additive — never let it fail the whole recap.
+      kpiDiagnostics = {
+        weekHeader: null,
+        found: {},
+        matchCounts: {},
+        weekSlots: 0,
+        weekRows: 0,
+        notes: [`KPI build error: ${kpiErr instanceof Error ? kpiErr.message : String(kpiErr)}`],
+      };
+    }
+
     const buffer = new Uint8Array(await out.xlsx.writeBuffer());
     if (!dryRun) {
       await uploadFile(driveId, folderPath, recapName, buffer);
@@ -179,9 +287,11 @@ export async function splitWorkbook(opts: {
       droppedWeeklyTabs: plan.dropped,
       recapBytes: buffer.byteLength,
       ms: Date.now() - t0,
+      kpiRowCount,
+      kpiSourceTab,
+      kpiDiagnostics,
     };
   } finally {
-    // Best-effort session close; never let cleanup mask a real result.
     graphFetch(`${base}/closeSession`, { method: "POST", body: "{}" }, sh).catch(() => {});
   }
 }
