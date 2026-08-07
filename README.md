@@ -17,11 +17,40 @@ touched, and recruiters change nothing about how they work.
 
 ```
 cron (weekday 6am/12pm/4pm CT)
+  ├─ Ringover: one pull for the whole firm, last N weeks
   └─ Graph workbook API reads master (any size)
        └─ writes  Aaron_Rider_Pipeline_2026_RECAP.xlsx  next to master
+            │        (mirrored tabs + a derived PHONE tab)
             └─ recruiter: "recap pipeline this week"
-                 └─ connector reads the small _RECAP file → skill → rundown
+                 └─ connector reads the small _RECAP file → skill → rundown/PDF
 ```
+
+## The PHONE tab
+
+Each recap also carries a `PHONE` tab: one row per recruiter per week, with
+per-weekday outbound call counts and talk seconds, plus totals, the daily
+average, and the goal. The eggers-pipeline-recap skill reads it to fill the
+three phone cards on the pipeline meeting KPI sheet.
+
+It lives here rather than in the skill for two reasons. Claude's sandbox
+can't reach `public-api.ringover.com` (egress allowlist), and a skill folder
+is the wrong place for an API key. This job already runs on a schedule with
+credentials, so it pulls once for everyone and drops the result next to the
+data the skill already reads.
+
+Every recap gets the same PHONE tab, because the team-comparison card needs
+everyone's numbers and the tab is only a few dozen rows.
+
+**The phone pull is strictly best-effort.** If Ringover is down, throttled,
+misconfigured, or simply not set up, `collectPhoneWeeks` returns an error
+instead of throwing, the recaps are written without the tab, and the run
+report says what happened. Recap files are the reason this job exists and a
+phone outage must never cost us them. `?noPhone=1` skips the pull entirely.
+
+Check `phone.status` in the run report (`ok` / `skipped` / `failed` /
+`disabled`) before trusting the tab. `phone.unmappedUsers` lists anyone who
+made calls but isn't in `RINGOVER_ROSTER` — they are silently excluded, so
+that list is worth reading after the first run.
 
 ## One-time setup
 

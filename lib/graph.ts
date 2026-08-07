@@ -164,7 +164,8 @@ export async function uploadFile(
   driveId: string,
   folderPath: string,
   fileName: string,
-  content: Uint8Array
+  content: Uint8Array,
+  contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 ): Promise<void> {
   const clean = folderPath.replace(/^\/+|\/+$/g, "");
   const itemPath = `${clean}/${fileName}`.split("/").map(encodeURIComponent).join("/");
@@ -173,7 +174,7 @@ export async function uploadFile(
     await graphFetch(
       `/drives/${driveId}/root:/${itemPath}:/content`,
       { method: "PUT", body: content },
-      { "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }
+      { "Content-Type": contentType }
     );
     return;
   }

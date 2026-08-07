@@ -1,31 +1,25 @@
 /**
- * Tab classification + KPI-grid extraction for recruiter pipeline
- * workbooks.
+ * Tab classification for recruiter pipeline workbooks — v2, hardened
+ * against real-world tab naming observed across all 11 recruiter
+ * workbooks in production ("Jan 12" with no year, "Current February,
+ * 16, 2026", "March30, 2026", "arch 23, 2026", "Februrary 23,2026",
+ * "March 2nd, 2026 (current)", "February 9, 2026 (2)", trailing and
+ * leading spaces, lowercase months, "March 30th. 2026", ...).
  *
- * Two responsibilities, both pure (no I/O) so they can be unit-tested
- * against fixtures:
+ * v1 assumed weekly tabs reliably parse as dates and kept everything
+ * that didn't. In production that inverted the trim for workbooks with
+ * year-less tab names (nothing parsed -> nothing dropped -> recap as
+ * big as the master). v2 flips the logic:
  *
- *   1. Tab classification (planKeep / isCoreTab / parseWeekTab) — decides
- *      which sheets the recap keeps. Unchanged from v2.
- *
- *   2. KPI-grid extraction (buildKpiTable) — NEW. Reads the embedded
- *      running-KPI grid inside a single weekly tab and returns one clean
- *      row per week with all 8 metrics. This is what makes every metric
- *      (not just First/Second Interviews) reliably recoverable after the
- *      M365 connector flattens the file to text: the recap gets a
- *      denormalized KPI_TABLE sheet where each week is ONE self-contained
- *      row, so flattening can't scramble which number belongs to which
- *      week or metric.
- *
- * Why the grid can't just be copied verbatim: the recruiter's KPI area is
- * several side-by-side / stacked mini-tables (Week|First|Second in one
- * block, Multiple|Offers in another, Accepted|Submittals|Agreements|
- * Resumes in a third). Each block is week-indexed with the SAME ordering
- * and the same quarter/YTD subtotal rows, but they don't share a single
- * header row. Reading them through the Graph workbook API preserves exact
- * (row,col) coordinates, so we anchor each metric to ITS OWN header and
- * join every metric by ordinal week position. That survives whether the
- * blocks are laid out horizontally or stacked vertically.
+ *   1. CORE tabs are recognized by fuzzy name matching against a small
+ *      known set (Active Positions, Clients, Candidates, Pipeline
+ *      Meeting, Master*, Sheet*). Always kept.
+ *   2. EVERYTHING else is a weekly tab. Keep the last N.
+ *   3. Ordering of weekly tabs: parsed date when available, otherwise
+ *      inferred from sheet position (workbook order is chronological
+ *      in practice — recruiters append new weeks). Position is the
+ *      tiebreaker and the fallback, so unparseable names still sort
+ *      correctly relative to their neighbors.
  */
 
 const MONTHS: Record<string, number> = {
@@ -39,9 +33,11 @@ const MONTHS: Record<string, number> = {
 function monthIndex(raw: string): number | null {
   const w = raw.toLowerCase();
   if (w in MONTHS) return MONTHS[w];
+  // prefix match ("janu", "febr")
   for (const [name, idx] of Object.entries(MONTHS)) {
     if (name.length >= 3 && (w.startsWith(name) || name.startsWith(w)) && w.length >= 3) return idx;
   }
+  // one-edit tolerance for typos like "arch" (March) or "Februrary"
   for (const [name, idx] of Object.entries(MONTHS)) {
     if (name.length < 4) continue;
     if (editDistanceLeq1ish(w, name)) return idx;
@@ -65,21 +61,23 @@ function editDistanceLeq1ish(a: string, b: string): boolean {
 }
 
 /**
- * Attempt to parse a weekly tab NAME into a Date. Lenient: strips noise
- * words/suffixes, tolerates missing commas/spaces, ordinals, periods,
- * typo'd months, and a missing year (uses defaultYear).
+ * Attempt to parse a weekly tab name into a Date. Extremely lenient:
+ * strips noise words/suffixes, tolerates missing commas/spaces,
+ * ordinals, periods, typo'd months, and a missing year (returns a
+ * year-less sentinel handled by the caller via defaultYear).
  */
 export function parseWeekTab(name: string, defaultYear?: number): Date | null {
   let s = name
     .trim()
     .toLowerCase()
-    .replace(/\(.*?\)/g, " ")
-    .replace(/\bcurrent\b/g, " ")
-    .replace(/(\d)(st|nd|rd|th)\b/g, "$1")
-    .replace(/[.,]/g, " ")
+    .replace(/\(.*?\)/g, " ")            // "(2)", "(current)"
+    .replace(/\bcurrent\b/g, " ")         // "Current Feb 9, 2026"
+    .replace(/(\d)(st|nd|rd|th)\b/g, "$1") // ordinals
+    .replace(/[.,]/g, " ")                // periods and commas -> space
     .replace(/\s+/g, " ")
     .trim();
 
+  // "march30 2026" -> "march 30 2026"
   s = s.replace(/([a-z])(\d)/g, "$1 $2");
 
   const m = s.match(/^([a-z]+)\s+(\d{1,2})(?:\s+(\d{4}))?$/);
@@ -91,19 +89,19 @@ export function parseWeekTab(name: string, defaultYear?: number): Date | null {
   const year = m[3] ? Number(m[3]) : defaultYear;
   if (year === undefined) return null;
   const d = new Date(Date.UTC(year, month, day));
-  if (d.getUTCMonth() !== month) return null;
+  if (d.getUTCMonth() !== month) return null; // impossible date rolled over
   return d;
 }
 
 /** Known non-weekly tabs, matched loosely (lowercased, trimmed, prefix). */
 const CORE_PREFIXES = [
-  "active po",
+  "active po",        // "Active Positions", "Active Postitions" (typo)
   "client",
   "candidate",
   "pipeline meeting",
   "sheet",
-  "master",
-  "kpi_table", // never treat our own derived sheet as a weekly tab
+  "master",           // "Master 2026 Pipeline"
+  "phone",            // derived tab this job writes; never a weekly tab
 ];
 
 export function isCoreTab(name: string): boolean {
@@ -141,6 +139,9 @@ export function planKeep(sheetNames: string[], weeksToKeep: number, defaultYear?
     weekly.push({ name, position: i, date: parseWeekTab(name, defaultYear) });
   }
 
+  // Order weekly tabs chronologically. Primary key: parsed date.
+  // Undated tabs inherit ordering from sheet position (workbooks are
+  // chronological in practice); position also breaks date ties.
   const sorted = [...weekly].sort((a, b) => {
     if (a.date && b.date && a.date.getTime() !== b.date.getTime()) {
       return a.date.getTime() - b.date.getTime();
@@ -157,295 +158,4 @@ export function planKeep(sheetNames: string[], weeksToKeep: number, defaultYear?
     else dropped.push(name);
   }
   return { keep, dropped };
-}
-
-/**
- * Given the kept sheet names, return the newest weekly tab (the one whose
- * embedded KPI grid is most up to date). Its running KPI table already
- * contains every week of the year, so we only need to parse this one tab
- * to build the full KPI_TABLE.
- */
-export function newestWeeklyTab(keep: string[], defaultYear?: number): string | null {
-  const weekly = keep
-    .map((name, i) => ({ name, position: i, date: parseWeekTab(name, defaultYear) }))
-    .filter((_, i) => !isCoreTab(keep[i]));
-  if (weekly.length === 0) return null;
-  weekly.sort((a, b) => {
-    if (a.date && b.date && a.date.getTime() !== b.date.getTime()) {
-      return a.date.getTime() - b.date.getTime();
-    }
-    return a.position - b.position;
-  });
-  return weekly[weekly.length - 1].name;
-}
-
-/* ======================================================================
- * KPI-grid extraction
- * ==================================================================== */
-
-/** Canonical, exact (normalized) header labels for the 8 metrics + Week. */
-const KPI_LABELS = {
-  week: "week",
-  firstInterviews: "first interviews",
-  secondInterviews: "second interviews",
-  multipleInterviews: "multiple interviews",
-  submittals: "submittals",
-  offers: "offers",
-  acceptedOffers: "accepted offers",
-  agreementsExecuted: "agreements executed",
-  resumes: "resumes",
-} as const;
-
-type MetricKey = Exclude<keyof typeof KPI_LABELS, "week">;
-
-const METRIC_KEYS: MetricKey[] = [
-  "firstInterviews",
-  "secondInterviews",
-  "multipleInterviews",
-  "submittals",
-  "offers",
-  "acceptedOffers",
-  "agreementsExecuted",
-  "resumes",
-];
-
-export interface KpiRow {
-  week: string; // ISO yyyy-mm-dd
-  firstInterviews: number | null;
-  secondInterviews: number | null;
-  multipleInterviews: number | null;
-  submittals: number | null;
-  offers: number | null;
-  acceptedOffers: number | null;
-  agreementsExecuted: number | null;
-  resumes: number | null;
-}
-
-export interface KpiDiagnostics {
-  weekHeader: { row: number; col: number } | null;
-  /** Per metric: the header cell chosen (0-based, grid-local), or null. */
-  found: Record<string, { row: number; col: number } | null>;
-  /** Per metric: how many candidate header matches were seen. */
-  matchCounts: Record<string, number>;
-  weekSlots: number; // total ordinal slots read from the Week column
-  weekRows: number; // of those, how many were real week dates
-  notes: string[];
-}
-
-export interface KpiExtraction {
-  rows: KpiRow[];
-  diagnostics: KpiDiagnostics;
-}
-
-function norm(v: unknown): string {
-  return String(v ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .replace(/[:]+$/, "");
-}
-
-/** Excel serial date -> ISO yyyy-mm-dd (UTC). 25569 = days 1899-12-30→1970-01-01. */
-function serialToISO(n: number): string | null {
-  if (!isFinite(n) || n < 1 || n > 60000) return null;
-  const ms = Math.round((n - 25569) * 86400 * 1000);
-  const d = new Date(ms);
-  if (isNaN(d.getTime())) return null;
-  return d.toISOString().slice(0, 10);
-}
-
-/** Try to read a cell as a date, using its number format as a hint. */
-function cellToISO(value: unknown, fmt: string | undefined): string | null {
-  const isDateFmt = !!fmt && /[dmy]/i.test(fmt) && fmt !== "General";
-  if (typeof value === "number" && isDateFmt) return serialToISO(value);
-  if (typeof value === "number" && value > 40000 && value < 50000) return serialToISO(value);
-  if (typeof value === "string") {
-    const s = value.trim();
-    let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-    if (m) {
-      const d = new Date(Date.UTC(Number(m[3]), Number(m[1]) - 1, Number(m[2])));
-      if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
-    }
-    m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
-    if (m) return `${m[1]}-${m[2]}-${m[3]}`;
-  }
-  return null;
-}
-
-/** Coerce a metric cell to a number, or null. Keeps fractional split credits. */
-function cellToNumber(value: unknown): number | null {
-  if (typeof value === "number" && isFinite(value)) return value;
-  if (typeof value === "string") {
-    const s = value.trim();
-    if (s === "") return null;
-    const n = Number(s);
-    if (isFinite(n)) return n;
-  }
-  return null;
-}
-
-/**
- * Build the denormalized KPI table from ONE weekly tab's used-range grid.
- *
- * @param values      2D values, grid-local indices ([0][0] = used-range top-left)
- * @param numberFormat 2D number formats, same shape as values
- *
- * Strategy:
- *   1. Find the topmost cell whose text == "week"  → the Week column.
- *   2. Read down the Week column, recording every slot in order (week
- *      dates AND total rows) until the YTD total, inclusive. Totals keep
- *      their ordinal slot so metric columns stay aligned.
- *   3. For each metric, find its header (exact label match, at/below the
- *      Week header row) and read its column from ITS OWN header downward.
- *      Ordinal k in the Week sequence == ordinal k below the metric header.
- *   4. Emit one row per Week slot that is a real date.
- *
- * Any metric whose header can't be found is left null — never fabricated.
- */
-export function buildKpiTable(values: unknown[][], numberFormat: string[][] = []): KpiExtraction {
-  const notes: string[] = [];
-  const found: KpiDiagnostics["found"] = {};
-  const matchCounts: KpiDiagnostics["matchCounts"] = {};
-  for (const k of METRIC_KEYS) {
-    found[k] = null;
-    matchCounts[k] = 0;
-  }
-
-  const nRows = values.length;
-  const nCols = values.reduce((m, r) => Math.max(m, r?.length ?? 0), 0);
-  const fmt = (r: number, c: number): string | undefined => numberFormat?.[r]?.[c];
-
-  // 1. Locate the Week header (topmost, leftmost exact "week").
-  let weekHeader: { row: number; col: number } | null = null;
-  for (let r = 0; r < nRows && !weekHeader; r++) {
-    for (let c = 0; c < nCols; c++) {
-      if (norm(values[r]?.[c]) === KPI_LABELS.week) {
-        weekHeader = { row: r, col: c };
-        break;
-      }
-    }
-  }
-
-  if (!weekHeader) {
-    notes.push('No "Week" header found — KPI grid could not be located.');
-    return {
-      rows: [],
-      diagnostics: { weekHeader: null, found, matchCounts, weekSlots: 0, weekRows: 0, notes },
-    };
-  }
-
-  // 2. Read the Week column into ordinal slots.
-  type Slot = { kind: "week" | "total" | "other"; iso?: string };
-  const slots: Slot[] = [];
-  let trailingBlanks = 0;
-  for (let r = weekHeader.row + 1; r < nRows; r++) {
-    const raw = values[r]?.[weekHeader.col];
-    const n = norm(raw);
-    if (n.includes("ytd")) {
-      slots.push({ kind: "total" });
-      break; // YTD is the last row of the grid
-    }
-    if (n.includes("total")) {
-      slots.push({ kind: "total" });
-      trailingBlanks = 0;
-      continue;
-    }
-    if (n === "") {
-      trailingBlanks++;
-      if (trailingBlanks >= 3) break; // grid has ended
-      slots.push({ kind: "other" });
-      continue;
-    }
-    trailingBlanks = 0;
-    const iso = cellToISO(raw, fmt(r, weekHeader.col));
-    slots.push(iso ? { kind: "week", iso } : { kind: "other" });
-  }
-  while (slots.length && slots[slots.length - 1].kind === "other") slots.pop();
-
-  const L = slots.length;
-
-  // 3. Locate each metric header and read its column by ordinal offset.
-  const metricValues: Record<MetricKey, Array<number | null>> = {
-    firstInterviews: [], secondInterviews: [], multipleInterviews: [], submittals: [],
-    offers: [], acceptedOffers: [], agreementsExecuted: [], resumes: [],
-  };
-
-  for (const key of METRIC_KEYS) {
-    const label = KPI_LABELS[key];
-    let chosen: { row: number; col: number } | null = null;
-    for (let r = weekHeader.row; r < nRows; r++) {
-      for (let c = 0; c < nCols; c++) {
-        if (norm(values[r]?.[c]) === label) {
-          matchCounts[key]++;
-          if (!chosen) chosen = { row: r, col: c }; // topmost wins
-        }
-      }
-    }
-    found[key] = chosen;
-    if (!chosen) {
-      notes.push(`Metric "${label}" header not found — column left blank.`);
-      metricValues[key] = new Array(L).fill(null);
-      continue;
-    }
-    const col = chosen.col;
-    const origin = chosen.row;
-    const out: Array<number | null> = [];
-    for (let k = 0; k < L; k++) {
-      const r = origin + 1 + k;
-      out.push(r < nRows ? cellToNumber(values[r]?.[col]) : null);
-    }
-    metricValues[key] = out;
-  }
-
-  // 4. Emit one row per real week slot.
-  const rows: KpiRow[] = [];
-  let weekRows = 0;
-  for (let k = 0; k < L; k++) {
-    if (slots[k].kind !== "week" || !slots[k].iso) continue;
-    weekRows++;
-    rows.push({
-      week: slots[k].iso as string,
-      firstInterviews: metricValues.firstInterviews[k] ?? null,
-      secondInterviews: metricValues.secondInterviews[k] ?? null,
-      multipleInterviews: metricValues.multipleInterviews[k] ?? null,
-      submittals: metricValues.submittals[k] ?? null,
-      offers: metricValues.offers[k] ?? null,
-      acceptedOffers: metricValues.acceptedOffers[k] ?? null,
-      agreementsExecuted: metricValues.agreementsExecuted[k] ?? null,
-      resumes: metricValues.resumes[k] ?? null,
-    });
-  }
-
-  return {
-    rows,
-    diagnostics: { weekHeader, found, matchCounts, weekSlots: L, weekRows, notes },
-  };
-}
-
-/** Column order for the emitted KPI_TABLE sheet (header row). */
-export const KPI_TABLE_HEADERS = [
-  "Week",
-  "First Interviews",
-  "Second Interviews",
-  "Multiple Interviews",
-  "Submittals",
-  "Offers",
-  "Accepted Offers",
-  "Agreements Executed",
-  "Resumes",
-];
-
-/** Turn a KpiRow into a plain array matching KPI_TABLE_HEADERS order. */
-export function kpiRowToArray(r: KpiRow): Array<string | number | null> {
-  return [
-    r.week,
-    r.firstInterviews,
-    r.secondInterviews,
-    r.multipleInterviews,
-    r.submittals,
-    r.offers,
-    r.acceptedOffers,
-    r.agreementsExecuted,
-    r.resumes,
-  ];
 }
